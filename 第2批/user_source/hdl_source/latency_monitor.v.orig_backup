@@ -1,0 +1,153 @@
+//=============================================================================
+//  latency_monitor —— 采集到显示的帧延迟测量
+//
+//  原理：
+//    视频链路使用 4 个 DDR 帧缓存，video_in 在每帧写入时产生写指针 wp，
+//    video_out 在每次显示帧开始时使用读指针 rp（rp = wp - 2）。
+//    本模块给每个缓存打上"写入帧序号"标签，显示帧开始时读取当前 rp 的标签，
+//    用"当前写帧序号 - 标签"得到该显示帧从采集到显示的帧龄。
+//
+//  说明：
+//    · 该值包含 DDR 帧缓存和扫描输出带来的系统延迟，典型为 2~3 帧。
+//    · 直方图均衡使用上一帧统计的 LUT，软件层会在 OSD/遥测中额外 +1 帧。
+//    · 所有逻辑在 DDR 时钟域，输出经两级同步送到像素时钟域。
+//=============================================================================
+module latency_monitor (
+    input  wire        I_ddr_clk,
+    input  wire        I_ddr_rst_n,
+
+    input  wire        I_write_frame_start,   // video_in 的写帧开始（DDR 域）
+    input  wire        I_display_frame_start, // video_out 的显示帧开始（DDR 域）
+    input  wire [1:0]  I_wr_ptr,
+    input  wire [1:0]  I_rd_ptr,
+    input  wire        I_clear,               // 单周期清计数（DDR 域）
+
+    input  wire        I_pix_clk,
+    input  wire        I_pix_rst_n,
+
+    output reg  [7:0]  O_frames,
+    output reg  [15:0] O_ms,
+    output reg         O_valid
+);
+
+    //------------------------------------------------------------------
+    // DDR 域：写帧计数 + 4 个缓存的帧标签
+    //------------------------------------------------------------------
+    reg [31:0] S_wr_cnt;
+    reg [31:0] S_tag0, S_tag1, S_tag2, S_tag3;
+    reg [3:0]  S_tag_valid;
+    reg [7:0]  S_lat_frames_ddr;
+    reg [15:0] S_lat_ms_ddr;
+    reg        S_lat_valid_ddr;
+
+    wire [31:0] S_tag_rd = (I_rd_ptr == 2'd0) ? S_tag0 :
+                           (I_rd_ptr == 2'd1) ? S_tag1 :
+                           (I_rd_ptr == 2'd2) ? S_tag2 : S_tag3;
+
+    wire [31:0] S_age = S_wr_cnt - S_tag_rd;
+
+    // 1 帧 = 16.667ms，用查表避免除法器
+    function [15:0] frames_to_ms;
+        input [7:0] f;
+        begin
+            case (f)
+                8'd0:  frames_to_ms = 16'd0;
+                8'd1:  frames_to_ms = 16'd17;
+                8'd2:  frames_to_ms = 16'd33;
+                8'd3:  frames_to_ms = 16'd50;
+                8'd4:  frames_to_ms = 16'd67;
+                8'd5:  frames_to_ms = 16'd83;
+                8'd6:  frames_to_ms = 16'd100;
+                8'd7:  frames_to_ms = 16'd117;
+                8'd8:  frames_to_ms = 16'd133;
+                8'd9:  frames_to_ms = 16'd150;
+                8'd10: frames_to_ms = 16'd167;
+                8'd11: frames_to_ms = 16'd183;
+                8'd12: frames_to_ms = 16'd200;
+                8'd13: frames_to_ms = 16'd217;
+                8'd14: frames_to_ms = 16'd233;
+                8'd15: frames_to_ms = 16'd250;
+                default: frames_to_ms = 16'd0;
+            endcase
+        end
+    endfunction
+
+    always @(posedge I_ddr_clk or negedge I_ddr_rst_n) begin
+        if (!I_ddr_rst_n) begin
+            S_wr_cnt          <= 32'd0;
+            S_tag0            <= 32'd0;
+            S_tag1            <= 32'd0;
+            S_tag2            <= 32'd0;
+            S_tag3            <= 32'd0;
+            S_tag_valid       <= 4'd0;
+            S_lat_frames_ddr  <= 8'd0;
+            S_lat_ms_ddr      <= 16'd0;
+            S_lat_valid_ddr   <= 1'b0;
+        end else begin
+            if (I_clear) begin
+                S_wr_cnt        <= 32'd0;
+                S_tag0          <= 32'd0;
+                S_tag1          <= 32'd0;
+                S_tag2          <= 32'd0;
+                S_tag3          <= 32'd0;
+                S_tag_valid     <= 4'd0;
+                S_lat_frames_ddr <= 8'd0;
+                S_lat_ms_ddr     <= 16'd0;
+                S_lat_valid_ddr  <= 1'b0;
+            end else begin
+                if (I_write_frame_start) begin
+                    case (I_wr_ptr)
+                        2'd0: S_tag0 <= S_wr_cnt + 32'd1;
+                        2'd1: S_tag1 <= S_wr_cnt + 32'd1;
+                        2'd2: S_tag2 <= S_wr_cnt + 32'd1;
+                        2'd3: S_tag3 <= S_wr_cnt + 32'd1;
+                    endcase
+                    S_tag_valid[I_wr_ptr] <= 1'b1;
+                    S_wr_cnt <= S_wr_cnt + 32'd1;
+                end
+
+                if (I_display_frame_start) begin
+                    if (S_tag_valid[I_rd_ptr] && (S_age < 32'd16)) begin
+                        S_lat_frames_ddr <= S_age[7:0];
+                        S_lat_ms_ddr     <= frames_to_ms(S_age[7:0]);
+                        S_lat_valid_ddr  <= 1'b1;
+                    end else begin
+                        S_lat_valid_ddr  <= 1'b0;
+                    end
+                end
+            end
+        end
+    end
+
+    //------------------------------------------------------------------
+    // 跨到像素时钟域（数值在 60Hz 更新，两级同步足够）
+    //------------------------------------------------------------------
+    reg [7:0]  S_f_s1, S_f_s2;
+    reg [15:0] S_ms_s1, S_ms_s2;
+    reg        S_v_s1, S_v_s2;
+
+    always @(posedge I_pix_clk or negedge I_pix_rst_n) begin
+        if (!I_pix_rst_n) begin
+            S_f_s1  <= 8'd0;
+            S_f_s2  <= 8'd0;
+            S_ms_s1 <= 16'd0;
+            S_ms_s2 <= 16'd0;
+            S_v_s1  <= 1'b0;
+            S_v_s2  <= 1'b0;
+            O_frames <= 8'd0;
+            O_ms     <= 16'd0;
+            O_valid  <= 1'b0;
+        end else begin
+            S_f_s1  <= S_lat_frames_ddr;
+            S_f_s2  <= S_f_s1;
+            S_ms_s1 <= S_lat_ms_ddr;
+            S_ms_s2 <= S_ms_s1;
+            S_v_s1  <= S_lat_valid_ddr;
+            S_v_s2  <= S_v_s1;
+            O_frames <= S_f_s2;
+            O_ms     <= S_ms_s2;
+            O_valid  <= S_v_s2;
+        end
+    end
+
+endmodule
